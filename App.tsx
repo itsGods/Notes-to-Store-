@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { User, Note, AppView, AIActionType } from './types';
+import { User, Note, AppView } from './types';
 import { 
   registerUser, 
   loginUser, 
@@ -9,8 +9,7 @@ import {
   saveNote, 
   deleteNote 
 } from './services/storageService';
-import { processNoteWithAI } from './services/geminiService';
-import { IOSButton, IOSInput, IOSCard } from './components/IOSComponents';
+import { IOSButton, IOSInput, IOSCard, IOSModal } from './components/IOSComponents';
 import { Icons } from './constants';
 
 const App: React.FC = () => {
@@ -21,20 +20,18 @@ const App: React.FC = () => {
   
   // Auth State
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
-  const [email, setEmail] = useState(''); // Changed from username to email
+  const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [authError, setAuthError] = useState('');
-  const [authSuccess, setAuthSuccess] = useState(''); // New state for success messages
+  const [authSuccess, setAuthSuccess] = useState('');
   const [isLoadingAuth, setIsLoadingAuth] = useState(false);
 
   // Editor State
   const [editorTitle, setEditorTitle] = useState('');
   const [editorContent, setEditorContent] = useState('');
-  const [isProcessingAI, setIsProcessingAI] = useState(false);
-  const [aiMenuOpen, setAiMenuOpen] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  // Search State
+  // List State
   const [searchQuery, setSearchQuery] = useState('');
 
   // --- Initialization ---
@@ -49,8 +46,6 @@ const App: React.FC = () => {
         }
       } catch (err) {
         console.error("Failed to initialize app session:", err);
-        // We silently fail here and let the user land on the auth screen
-        // rather than crashing the entire React tree.
       }
     };
     initSession();
@@ -59,6 +54,53 @@ const App: React.FC = () => {
   const loadNotes = async (userId: string) => {
     const userNotes = await getNotes(userId);
     setNotes(userNotes);
+  };
+
+  // --- Helper: Date Grouping ---
+  const groupedNotes = useMemo(() => {
+    if (!notes.length) return {};
+    
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    const isSameDay = (d1: Date, d2: Date) => 
+      d1.getDate() === d2.getDate() && 
+      d1.getMonth() === d2.getMonth() && 
+      d1.getFullYear() === d2.getFullYear();
+
+    const groups: { [key: string]: Note[] } = {
+      'Today': [],
+      'Yesterday': [],
+      'Previous 30 Days': [],
+      'Older': []
+    };
+
+    const filtered = notes.filter(n => {
+        if (!searchQuery) return true;
+        const q = searchQuery.toLowerCase();
+        return n.title.toLowerCase().includes(q) || n.content.toLowerCase().includes(q);
+    });
+
+    filtered.forEach(note => {
+      const date = new Date(note.updated_at);
+      if (isSameDay(date, today)) {
+        groups['Today'].push(note);
+      } else if (isSameDay(date, yesterday)) {
+        groups['Yesterday'].push(note);
+      } else if (today.getTime() - date.getTime() < 30 * 24 * 60 * 60 * 1000) {
+        groups['Previous 30 Days'].push(note);
+      } else {
+        groups['Older'].push(note);
+      }
+    });
+
+    return groups;
+  }, [notes, searchQuery]);
+
+  // --- Helpers: Stats ---
+  const getWordCount = (text: string) => {
+    return text.trim().split(/\s+/).filter(w => w.length > 0).length;
   };
 
   // --- Auth Handlers ---
@@ -80,11 +122,9 @@ const App: React.FC = () => {
         if (user) {
           handleLoginSuccess(user);
         } else {
-          // If error mentions checking email, it's actually a success state for UI purposes,
-          // but we stay on the auth screen.
           if (error && error.includes('check your email')) {
              setAuthSuccess(error);
-             setAuthMode('login'); // Switch to login mode so they can login after confirming
+             setAuthMode('login'); 
              setEmail('');
              setPassword('');
           } else {
@@ -100,7 +140,7 @@ const App: React.FC = () => {
         }
       }
     } catch (err) {
-      setAuthError('An unexpected error occurred. Please check your connection.');
+      setAuthError('Connection failed.');
     } finally {
       setIsLoadingAuth(false);
     }
@@ -113,7 +153,6 @@ const App: React.FC = () => {
     setEmail('');
     setPassword('');
     setAuthError('');
-    setAuthSuccess('');
   };
 
   const handleLogout = async () => {
@@ -129,7 +168,6 @@ const App: React.FC = () => {
     setEditorTitle(note.title);
     setEditorContent(note.content);
     setCurrentView(AppView.EDITOR);
-    setAiMenuOpen(false);
   };
 
   const createNewNote = () => {
@@ -137,16 +175,25 @@ const App: React.FC = () => {
     setEditorTitle('');
     setEditorContent('');
     setCurrentView(AppView.EDITOR);
-    setAiMenuOpen(false);
   };
 
-  const saveCurrentNote = async () => {
+  const saveCurrentNote = async (shouldExit = false) => {
     if (!currentUser) return;
     
-    // If empty, just go back without saving
-    if (!editorTitle.trim() && !editorContent.trim()) {
-        setCurrentView(AppView.LIST);
-        return;
+    // Auto-title if empty but content exists
+    let titleToSave = editorTitle.trim();
+    const contentToSave = editorContent;
+
+    if (!titleToSave && !contentToSave.trim()) {
+       if (shouldExit) setCurrentView(AppView.LIST);
+       return;
+    }
+
+    if (!titleToSave && contentToSave) {
+        // Grab first few words as title
+        titleToSave = contentToSave.split('\n')[0].substring(0, 30) || 'New Note';
+    } else if (!titleToSave) {
+        titleToSave = 'New Note';
     }
 
     setIsSaving(true);
@@ -154,16 +201,22 @@ const App: React.FC = () => {
       const noteToSave: Note = {
         id: selectedNote ? selectedNote.id : crypto.randomUUID(),
         user_id: currentUser.id,
-        title: editorTitle || 'New Note',
-        content: editorContent,
+        title: titleToSave,
+        content: contentToSave,
         updated_at: new Date().toISOString()
       };
 
       await saveNote(noteToSave);
-      await loadNotes(currentUser.id);
-      setCurrentView(AppView.LIST);
+      await loadNotes(currentUser.id); // Refresh list
+      
+      if (shouldExit) {
+        setCurrentView(AppView.LIST);
+      } else {
+        // If just saving (e.g. auto-save logic later), update selected note so we don't create dupes
+        setSelectedNote(noteToSave);
+      }
     } catch (e: any) {
-      alert(`Failed to save note: ${e.message}`);
+      alert(`Failed to save: ${e.message}`);
     } finally {
       setIsSaving(false);
     }
@@ -171,57 +224,47 @@ const App: React.FC = () => {
 
   const deleteCurrentNote = async () => {
     if (selectedNote && currentUser) {
-      await deleteNote(selectedNote.id);
-      await loadNotes(currentUser.id);
-    }
-    setCurrentView(AppView.LIST);
-  };
-
-  // --- AI Handlers ---
-  const handleAIAction = async (action: AIActionType) => {
-    if (!editorContent) return;
-    
-    setIsProcessingAI(true);
-    setAiMenuOpen(false);
-    
-    try {
-      const result = await processNoteWithAI(editorContent, action);
-      setEditorContent(result);
-    } catch (err) {
-      alert("AI processing failed. Check your API key.");
-    } finally {
-      setIsProcessingAI(false);
+      if (confirm('Are you sure you want to delete this note?')) {
+        await deleteNote(selectedNote.id);
+        await loadNotes(currentUser.id);
+        setCurrentView(AppView.LIST);
+      }
+    } else {
+        // Just discard new note
+        setCurrentView(AppView.LIST);
     }
   };
 
-  // --- Filtering ---
-  const filteredNotes = useMemo(() => {
-    if (!searchQuery) return notes;
-    const lowerQ = searchQuery.toLowerCase();
-    return notes.filter(n => 
-      n.title.toLowerCase().includes(lowerQ) || 
-      n.content.toLowerCase().includes(lowerQ)
-    );
-  }, [notes, searchQuery]);
+  const handleBack = () => {
+      saveCurrentNote(true);
+  };
 
   // --- Views ---
 
   const renderAuth = () => (
-    <div className="min-h-screen flex items-center justify-center p-6 bg-ios-background">
-      <div className="w-full max-w-sm">
-        <div className="text-center mb-10">
-          <h1 className="text-4xl font-bold text-gray-900 mb-2 tracking-tight">NotesAI</h1>
-          <p className="text-gray-500">Secure cloud notes with Gemini.</p>
+    <div className="min-h-screen flex items-center justify-center p-6 bg-[#F2F2F7]">
+        <div className="absolute inset-0 overflow-hidden pointer-events-none">
+            <div className="absolute -top-[20%] -left-[10%] w-[70vh] h-[70vh] rounded-full bg-blue-400/20 blur-[100px]" />
+            <div className="absolute bottom-[0%] right-[0%] w-[50vh] h-[50vh] rounded-full bg-yellow-400/20 blur-[100px]" />
         </div>
 
-        <IOSCard className="mb-6">
-          <form onSubmit={handleAuth} className="space-y-4">
+      <div className="w-full max-w-sm relative z-10">
+        <div className="text-center mb-12">
+            <div className="inline-flex items-center justify-center w-20 h-20 rounded-3xl bg-white shadow-xl mb-6">
+                <span className="text-4xl">📝</span>
+            </div>
+          <h1 className="text-3xl font-bold text-gray-900 tracking-tight">NotesAI</h1>
+          <p className="text-gray-500 mt-2 font-medium">Think better. Write faster.</p>
+        </div>
+
+        <div className="glass-panel rounded-3xl p-8 shadow-glass border border-white/50">
+          <form onSubmit={handleAuth} className="space-y-5">
             <IOSInput 
               label="Email"
               type="email"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              placeholder="name@example.com"
+              placeholder="hello@example.com"
               disabled={isLoadingAuth}
             />
             <IOSInput 
@@ -234,35 +277,38 @@ const App: React.FC = () => {
             />
             
             {authError && (
-              <p className="text-ios-red text-sm text-center font-medium">{authError}</p>
+              <div className="p-3 bg-red-50 text-red-600 text-sm rounded-xl flex items-center gap-2">
+                 <div className="w-1.5 h-1.5 rounded-full bg-red-500" />
+                 {authError}
+              </div>
             )}
-
+            
             {authSuccess && (
-              <p className="text-green-600 text-sm text-center font-medium bg-green-50 p-2 rounded-lg border border-green-100">
-                {authSuccess}
-              </p>
+              <div className="p-3 bg-green-50 text-green-700 text-sm rounded-xl">
+                 {authSuccess}
+              </div>
             )}
 
-            <div className="pt-2">
-              <IOSButton type="submit" fullWidth disabled={isLoadingAuth}>
-                {isLoadingAuth ? 'Please wait...' : (authMode === 'login' ? 'Log In' : 'Sign Up')}
+            <div className="pt-4">
+              <IOSButton type="submit" fullWidth disabled={isLoadingAuth} variant="primary" className="shadow-lg shadow-yellow-500/20">
+                {isLoadingAuth ? (
+                    <div className="w-5 h-5 border-2 border-black/30 border-t-black rounded-full animate-spin" />
+                ) : (authMode === 'login' ? 'Log In' : 'Create Account')}
               </IOSButton>
             </div>
           </form>
-        </IOSCard>
+        </div>
 
-        <div className="text-center">
+        <div className="text-center mt-8">
           <button 
             type="button"
             onClick={() => {
               setAuthMode(authMode === 'login' ? 'signup' : 'login');
               setAuthError('');
-              setAuthSuccess('');
             }}
-            className="text-ios-blue text-sm font-semibold hover:underline"
-            disabled={isLoadingAuth}
+            className="text-ios-gray hover:text-ios-blue text-sm font-semibold transition-colors"
           >
-            {authMode === 'login' ? "Don't have an account? Sign up" : "Already have an account? Log in"}
+            {authMode === 'login' ? "New here? Create an account" : "Have an account? Log in"}
           </button>
         </div>
       </div>
@@ -270,157 +316,159 @@ const App: React.FC = () => {
   );
 
   const renderList = () => (
-    <div className="min-h-screen bg-ios-background pb-20">
-      {/* Sticky Header */}
-      <div className="sticky top-0 z-20 bg-ios-background/80 backdrop-blur-xl border-b border-gray-200/50 pt-12 pb-2 px-4">
-        <div className="max-w-3xl mx-auto">
-          <div className="flex justify-between items-center mb-4">
-            <h1 className="text-4xl font-bold text-gray-900 tracking-tight">Notes</h1>
-            <button 
-              onClick={handleLogout} 
-              className="p-2 bg-gray-200 rounded-full text-gray-600 hover:bg-gray-300 transition-colors"
-            >
-              <Icons.LogOut className="w-5 h-5" />
-            </button>
-          </div>
-          
-          <div className="relative">
-            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <Icons.Search className="h-5 w-5 text-gray-400" />
-            </div>
-            <input
-              type="text"
-              placeholder="Search"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="block w-full pl-10 pr-3 py-2 bg-gray-200/50 rounded-lg leading-5 placeholder-gray-500 focus:outline-none focus:bg-white focus:ring-0 transition duration-150 ease-in-out sm:text-sm"
-            />
-          </div>
-        </div>
+    <div className="min-h-screen bg-[#F2F2F7]">
+      {/* Navigation Bar */}
+      <div className="sticky top-0 z-30 bg-[#F2F2F7]/95 backdrop-blur-xl border-b border-gray-200/50 pt-safe-top">
+         <div className="flex justify-between items-center px-4 py-3">
+             <button onClick={handleLogout} className="text-ios-blue text-sm font-medium hover:opacity-70">
+                 Sign Out
+             </button>
+             <button className="p-2 bg-white rounded-full shadow-sm text-ios-yellow hover:bg-gray-50">
+                 <Icons.MoreCircle className="w-5 h-5" />
+             </button>
+         </div>
+         <div className="px-5 pb-4">
+             <h1 className="text-4xl font-bold text-gray-900 tracking-tight">Notes</h1>
+             
+             {/* Search Bar */}
+             <div className="mt-4 relative group">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+                  <Icons.Search className="h-4 w-4 text-gray-500" />
+                </div>
+                <input
+                  type="text"
+                  placeholder="Search"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="block w-full pl-9 pr-3 py-2 bg-[#E3E3E8] rounded-xl leading-5 placeholder-gray-500 focus:outline-none focus:bg-white focus:ring-2 focus:ring-ios-yellow/50 transition-all duration-200 sm:text-sm"
+                />
+              </div>
+         </div>
       </div>
 
-      {/* List Content */}
-      <div className="max-w-3xl mx-auto px-4 py-6">
-        {filteredNotes.length === 0 ? (
-          <div className="text-center py-20 opacity-50">
-            <p className="text-xl font-medium text-gray-400">No notes yet</p>
-            <p className="text-sm text-gray-400 mt-2">Tap the + button to create one</p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {filteredNotes.map(note => (
-              <IOSCard key={note.id} onClick={() => openNote(note)} className="h-48 flex flex-col justify-between group hover:shadow-lg transition-shadow">
-                <div>
-                  <h3 className="font-bold text-lg text-gray-900 mb-2 line-clamp-1">{note.title}</h3>
-                  <p className="text-gray-500 text-sm line-clamp-4 leading-relaxed">
-                    {note.content || <span className="italic opacity-50">No content</span>}
-                  </p>
+      {/* Notes List */}
+      <div className="px-4 pb-24 pt-2">
+        {Object.keys(groupedNotes).map(group => {
+            const groupNotes = groupedNotes[group];
+            if (groupNotes.length === 0) return null;
+
+            return (
+                <div key={group} className="mb-8">
+                    <h2 className="text-xl font-bold text-gray-900 mb-3 px-1">{group}</h2>
+                    <div className="space-y-3">
+                        {groupNotes.map(note => (
+                            <IOSCard 
+                                key={note.id} 
+                                onClick={() => openNote(note)}
+                                className="flex flex-col gap-1.5 active:scale-[0.98] transition-transform"
+                            >
+                                <h3 className="font-semibold text-gray-900 line-clamp-1 text-lg">
+                                    {note.title || <span className="text-gray-400 italic">No Title</span>}
+                                </h3>
+                                <div className="flex items-start gap-2">
+                                    <span className="text-sm text-gray-400 whitespace-nowrap min-w-fit">
+                                        {new Date(note.updated_at).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                                    </span>
+                                    <p className="text-sm text-gray-500 line-clamp-2 leading-relaxed">
+                                        {note.content || <span className="opacity-50">No additional text</span>}
+                                    </p>
+                                </div>
+                            </IOSCard>
+                        ))}
+                    </div>
                 </div>
-                <div className="text-xs text-gray-400 font-medium pt-4 border-t border-gray-100 mt-2">
-                  {new Date(note.updated_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+            );
+        })}
+        
+        {notes.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-20 opacity-40">
+                <div className="w-16 h-16 bg-gray-200 rounded-2xl flex items-center justify-center mb-4">
+                    <Icons.Plus className="w-8 h-8 text-gray-500" />
                 </div>
-              </IOSCard>
-            ))}
-          </div>
+                <p className="text-lg font-medium text-gray-500">No Notes Yet</p>
+            </div>
         )}
       </div>
 
-      {/* Floating Action Button */}
-      <div className="fixed bottom-6 right-6 z-30">
+      {/* FAB */}
+      <div className="fixed bottom-8 right-6 z-40">
         <button 
           onClick={createNewNote}
-          className="bg-ios-blue text-white w-14 h-14 rounded-full shadow-lg shadow-ios-blue/30 flex items-center justify-center hover:scale-105 active:scale-95 transition-all"
+          className="bg-ios-yellow text-black w-14 h-14 rounded-full shadow-lg shadow-orange-500/20 flex items-center justify-center hover:brightness-105 active:scale-90 transition-all duration-300"
         >
-          <Icons.Plus className="w-8 h-8" />
+          <Icons.Plus className="w-8 h-8 stroke-[2.5]" />
         </button>
       </div>
     </div>
   );
 
   const renderEditor = () => (
-    <div className="min-h-screen bg-white flex flex-col h-screen overflow-hidden">
+    <div className="fixed inset-0 bg-white z-50 flex flex-col animate-slide-up">
       {/* Editor Header */}
-      <div className="px-4 py-3 flex justify-between items-center border-b border-gray-100 bg-white/90 backdrop-blur-md z-10">
+      <div className="px-4 py-3 flex justify-between items-center bg-white/80 backdrop-blur-md border-b border-gray-100 z-10 sticky top-0">
         <button 
-          onClick={saveCurrentNote}
-          disabled={isSaving}
-          className="flex items-center text-ios-blue font-medium text-base hover:opacity-70 transition-opacity -ml-2 px-2 py-1 disabled:opacity-50"
+          onClick={handleBack}
+          className="flex items-center text-ios-yellow font-semibold text-base -ml-2 px-2 py-2 hover:opacity-70 transition-opacity active:scale-95"
         >
-          <Icons.ChevronLeft className="w-6 h-6 mr-0.5" />
-          {isSaving ? 'Saving...' : 'Notes'}
+          <Icons.ChevronLeft className="w-7 h-7 mr-0.5" />
+          Notes
         </button>
         
-        <div className="flex gap-2">
-           {/* AI Menu Trigger */}
-          <div className="relative">
-            <button 
-              onClick={() => setAiMenuOpen(!aiMenuOpen)}
-              className="p-2 text-ios-blue hover:bg-blue-50 rounded-full transition-colors"
-              title="AI Tools"
-            >
-              <Icons.Sparkles className="w-5 h-5" />
-            </button>
-            
-            {aiMenuOpen && (
-               <div className="absolute right-0 top-full mt-2 w-56 bg-white rounded-xl shadow-xl border border-gray-100 p-1.5 z-50 flex flex-col gap-1 overflow-hidden animate-in fade-in zoom-in-95 duration-100 origin-top-right">
-                  <button 
-                    onClick={() => handleAIAction(AIActionType.FIX_GRAMMAR)}
-                    disabled={isProcessingAI}
-                    className="flex items-center w-full px-3 py-2 text-sm text-left text-gray-700 hover:bg-gray-100 rounded-lg disabled:opacity-50"
-                  >
-                    Fix Grammar
-                  </button>
-                  <button 
-                    onClick={() => handleAIAction(AIActionType.SUMMARIZE)}
-                    disabled={isProcessingAI}
-                    className="flex items-center w-full px-3 py-2 text-sm text-left text-gray-700 hover:bg-gray-100 rounded-lg disabled:opacity-50"
-                  >
-                    Summarize (Replace)
-                  </button>
-                  <button 
-                    onClick={() => handleAIAction(AIActionType.CONTINUE_WRITING)}
-                    disabled={isProcessingAI}
-                    className="flex items-center w-full px-3 py-2 text-sm text-left text-gray-700 hover:bg-gray-100 rounded-lg disabled:opacity-50"
-                  >
-                    Continue Writing
-                  </button>
-               </div>
-            )}
-          </div>
-
+        <div className="flex items-center gap-2">
+          <button 
+             onClick={() => {
+                 const link = window.location.href;
+                 navigator.clipboard.writeText(`${link} (Note: ${editorTitle})`);
+                 alert("Link copied to clipboard!");
+             }}
+             className="p-2 text-gray-400 hover:bg-gray-100 rounded-full transition-colors"
+          >
+             <Icons.Share className="w-5 h-5" />
+          </button>
           <button 
             onClick={deleteCurrentNote}
-            className="p-2 text-ios-red hover:bg-red-50 rounded-full transition-colors"
+            className="p-2 text-gray-400 hover:bg-red-50 hover:text-red-500 rounded-full transition-colors"
           >
             <Icons.Trash className="w-5 h-5" />
           </button>
         </div>
       </div>
 
-      {/* Loading Overlay for AI */}
-      {isProcessingAI && (
-        <div className="absolute inset-0 bg-white/50 backdrop-blur-sm z-50 flex items-center justify-center">
-            <div className="bg-white shadow-xl rounded-2xl p-4 flex items-center gap-3">
-               <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-ios-blue"></div>
-               <span className="text-gray-600 font-medium">Gemini is thinking...</span>
-            </div>
+      {/* Editor Canvas */}
+      <div className="flex-1 overflow-y-auto relative">
+        <div className="max-w-3xl mx-auto px-6 py-8 pb-32 min-h-full">
+            <input
+              value={editorTitle}
+              onChange={(e) => setEditorTitle(e.target.value)}
+              placeholder="Title"
+              className="w-full text-4xl font-bold text-gray-900 placeholder-gray-300 border-none outline-none bg-transparent mb-6"
+            />
+            <textarea
+              value={editorContent}
+              onChange={(e) => setEditorContent(e.target.value)}
+              placeholder="Start typing..."
+              className="w-full h-full min-h-[50vh] resize-none text-lg text-gray-800 placeholder-gray-300 border-none outline-none bg-transparent leading-relaxed font-normal"
+              spellCheck={false}
+            />
         </div>
-      )}
+      </div>
 
-      {/* Inputs */}
-      <div className="flex-1 overflow-y-auto p-5 max-w-3xl mx-auto w-full">
-        <input
-          value={editorTitle}
-          onChange={(e) => setEditorTitle(e.target.value)}
-          placeholder="Title"
-          className="w-full text-3xl font-bold text-gray-900 placeholder-gray-300 border-none outline-none bg-transparent mb-4"
-        />
-        <textarea
-          value={editorContent}
-          onChange={(e) => setEditorContent(e.target.value)}
-          placeholder="Start typing..."
-          className="w-full h-[calc(100%-80px)] resize-none text-lg text-gray-800 placeholder-gray-300 border-none outline-none bg-transparent leading-relaxed"
-        />
+      {/* Bottom Toolbar */}
+      <div className="absolute bottom-0 left-0 right-0 bg-white/90 backdrop-blur-xl border-t border-gray-200 px-4 py-3 pb-safe-bottom z-20">
+          <div className="max-w-3xl mx-auto flex justify-between items-center">
+             
+             {/* Stats */}
+             <div className="text-[10px] font-medium text-gray-400 uppercase tracking-widest">
+                 {getWordCount(editorContent)} words
+             </div>
+
+             {/* Time */}
+             <div className="text-right">
+                 <span className="text-xs text-gray-300">
+                    {new Date().toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}
+                 </span>
+             </div>
+          </div>
       </div>
     </div>
   );
